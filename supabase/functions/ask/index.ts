@@ -13,11 +13,13 @@ type QueryType =
   | 'unknown'
 
 // Detect query type from question text
+// Only match very explicit queries - let LLM handle everything else
 function detectQueryType(question: string): QueryType {
-  const lowerQuestion = question.toLowerCase()
+  const lowerQuestion = question.toLowerCase().trim()
   
-  // Total queries
-  if (lowerQuestion.match(/\b(total|spent|spending|sum|how much)\b/)) {
+  // Very explicit total queries only (must have question words + amount keywords)
+  if (lowerQuestion.match(/^(what|how much|show me|tell me|give me)\s+(is|are|was|were|did|do|can|will)\s+(my|the)\s+(total|spent|spending|sum)/i) ||
+      lowerQuestion.match(/^(what|how much)\s+(is|are|was|were)\s+(my|the)\s+(total|spent|spending)/i)) {
     if (lowerQuestion.match(/\b(today|todays)\b/)) return 'total_today'
     if (lowerQuestion.match(/\b(this week|week|weekly)\b/)) return 'total_this_week'
     if (lowerQuestion.match(/\b(this month|month|monthly)\b/)) return 'total_this_month'
@@ -25,13 +27,13 @@ function detectQueryType(question: string): QueryType {
     return 'total_all'
   }
   
-  // Recent transactions
-  if (lowerQuestion.match(/\b(recent|latest|last|recently|show me|list|what are)\b/)) {
-    if (lowerQuestion.match(/\b(transaction|expense|purchase|spending)\b/)) {
-      return 'recent_transactions'
-    }
+  // Very explicit recent transactions queries only
+  if (lowerQuestion.match(/^(show|list|tell me|give me|what are)\s+(me\s+)?(my\s+)?(recent|latest|last)\s+(transaction|expense|purchase)/i) ||
+      lowerQuestion.match(/^(what|which)\s+(are|were)\s+(my\s+)?(recent|latest|last)\s+(transaction|expense|purchase)/i)) {
+    return 'recent_transactions'
   }
   
+  // Everything else goes to LLM
   return 'unknown'
 }
 
@@ -317,25 +319,43 @@ Deno.serve(async (req) => {
         answer_text = await callLLM(question, context)
       }
     } else {
-      // Unknown query type, use LLM
-      // Get context for LLM
-      const { data: recentDocs } = await supabase
+      // Unknown query type, use LLM with comprehensive data
+      // Get all transactions for better context
+      const { data: allDocs } = await supabase
         .from('documents')
         .select('id')
         .eq('user_id', user_id)
         .order('created_at', { ascending: false })
-        .limit(5)
       
-      const docIds = recentDocs?.map(d => d.id) || []
-      const { data: recentTransactions } = await supabase
+      const docIds = allDocs?.map(d => d.id) || []
+      
+      // Get all transactions
+      const { data: allTransactions } = await supabase
         .from('transactions')
-        .select('amount, merchant, category, transaction_date')
+        .select('amount, merchant, category, description, transaction_date, currency')
         .in('document_id', docIds)
-        .limit(10)
+        .order('transaction_date', { ascending: false })
       
-      const context = recentTransactions && recentTransactions.length > 0
-        ? `Recent transactions: ${JSON.stringify(recentTransactions)}`
-        : "User has no transactions yet."
+      // Calculate summary stats for LLM context
+      const totalAmount = allTransactions?.reduce((sum, t) => sum + parseFloat(t.amount), 0) || 0
+      const categoryTotals: Record<string, number> = {}
+      allTransactions?.forEach(t => {
+        const cat = t.category || 'Uncategorized'
+        categoryTotals[cat] = (categoryTotals[cat] || 0) + parseFloat(t.amount)
+      })
+      
+      // Build comprehensive context
+      let context = `User's expense data:\n`
+      if (allTransactions && allTransactions.length > 0) {
+        context += `- Total transactions: ${allTransactions.length}\n`
+        context += `- Total spending: $${totalAmount.toFixed(2)}\n`
+        if (Object.keys(categoryTotals).length > 0) {
+          context += `- Spending by category: ${JSON.stringify(categoryTotals)}\n`
+        }
+        context += `- Recent transactions (last 10): ${JSON.stringify(allTransactions.slice(0, 10))}\n`
+      } else {
+        context += "User has no transactions yet."
+      }
       
       answer_text = await callLLM(question, context)
     }
