@@ -194,7 +194,7 @@ async function extractCityCountry(rawText: string): Promise<{ city: string | nul
   }
 }
 
-// Structured extraction result from OpenAI. Optional amount_source when heuristic or retry used.
+// Structured extraction result from OpenAI (image + optional OCR text). Do not assume; use null when unclear.
 type ExtractedReceipt = {
   full_text: string
   ai_summary: string | null
@@ -206,134 +206,23 @@ type ExtractedReceipt = {
   transaction_date: string | null
   city: string | null
   country: string | null
-  amount_source?: string
 }
 
-const TRANSCRIBE_SYSTEM = `Transcribe the document exactly as printed. Preserve layout and line breaks. Include every line: store name, address, items, prices, totals, payment lines, dates. Do not interpret or summarize. Use the exact characters (numbers, commas, dots) as on the document. Output plain text only.`
+const EXTRACTION_SYSTEM = `You are a receipt/document extraction system. Your goal is to extract information with maximum accuracy (match exactly what is on the document). Use both the image and any provided OCR text.
 
-const EXTRACTION_SYSTEM = `You are a financial document extraction engine.
+Rules:
+- full_text: Transcribe ALL visible text from the receipt/document in order. Preserve line breaks. Include every line item, price, total, date, store name, address. Do not summarize or omit. Use the exact characters (numbers, commas, dots) as shown. For European receipts use comma as decimal separator in the text if that is what is printed (e.g. 173,87).
+- amount: The final total amount paid (the main total/totaal/TOTAL/BETALING line). Convert to a number with a dot for decimals (e.g. 173.87). If the receipt shows 173,87 or 173.87 use 173.87. Only the final paid total, not subtotals or line items.
+- currency: From the document (e.g. EUR, €, USD). Belgium/Netherlands/France/Germany/Spain/Italy → EUR. UK → GBP. US → USD. Canada → CAD.
+- transaction_date: The date on the receipt (sale or payment date). Convert to YYYY-MM-DD (e.g. 19/01/20 → 2020-01-19, 28-02-2026 → 2026-02-28).
+- merchant: The exact store or business name as printed (e.g. AD DOK NOORD, Best Buy). First line of the receipt or the clear store name.
+- city: From the address if present (e.g. GENT, Brussels). One word or short phrase.
+- country: From the address or infer from context (e.g. Belgium, Netherlands, USA).
+- category: One short label (e.g. Groceries, Supermarket, Electronics, Restaurant). No amount in category.
+- ai_summary: One short label for the type of receipt (e.g. Groceries, Supermarket). Must NOT include amount or currency.
+- description: Optional short description of what was bought (e.g. "Groceries and household items"); or null. Do not put the full item list here.
 
-Extract structured data from a receipt or invoice transcript.
-
-CRITICAL: Accuracy is more important than completeness.
-If uncertain, omit the field instead of guessing.
-
--------------------------------------
-AMOUNT RULE (VERY IMPORTANT)
--------------------------------------
-
-1. Identify ALL monetary values in the transcript.
-2. If a payment confirmation line exists (e.g. BANCONTACT, VISA, MASTERCARD, CARD, PAYMENT, BETALING, BANKCONTACT):
-   → Select the amount associated with that payment line.
-
-3. Otherwise:
-   → Select the final TOTAL / TOTAAL / GRAND TOTAL amount at the bottom of the receipt.
-
-Never select:
-- Subtotal
-- VAT-only amounts
-- Tax breakdown lines
-- Promo/discount lines
-- Individual item prices
-- Change/return amounts
-
-Convert to number with dot decimal (173,87 → 173.87).
-If ambiguous, omit.
-
--------------------------------------
-MERCHANT RULE
--------------------------------------
-
-- Prefer the top header line.
-- Prefer large uppercase store name.
-- Do NOT use payment processors.
-- Do NOT use bank names.
-- Do NOT use product names.
-
--------------------------------------
-DATE RULE
--------------------------------------
-
-- Extract the transaction/sale/payment date.
-- Ignore billing periods unless no transaction date exists.
-- Ignore due dates.
-- If multiple dates exist, prefer the transaction date.
-- Convert to YYYY-MM-DD.
-- If ambiguous, omit.
-
--------------------------------------
-CURRENCY RULE
--------------------------------------
-
-Extract currency ONLY if a symbol or code is clearly visible (€,$,EUR,USD,GBP,CAD).
-Do NOT infer currency from country.
-
--------------------------------------
-LOCATION RULE
--------------------------------------
-
-Extract city and country from address lines.
-If missing, omit.
-Do not infer from IBAN or bank codes.
-
--------------------------------------
-CATEGORY RULE
--------------------------------------
-
-Return one short label (e.g. Groceries, Supermarket, Restaurant, Utilities, Electronics).
-Do not include amount in category.
-
--------------------------------------
-GENERAL RULE
--------------------------------------
-
-Do NOT guess.
-If uncertain, omit.
-Return JSON only.`
-
-function classifyDocumentType(transcript: string): 'receipt' | 'invoice' {
-  const lower = transcript.toLowerCase()
-  if (
-    lower.includes('invoice') ||
-    lower.includes('factuur') ||
-    lower.includes('bill to') ||
-    lower.includes('due date') ||
-    lower.includes('invoice number')
-  ) {
-    return 'invoice'
-  }
-  return 'receipt'
-}
-
-function detectTotalHeuristic(transcript: string): number | null {
-  const paymentRegex = /(bancontact|visa|mastercard|card|payment)[^\d]{0,20}(\d+[.,]\d{2})/i
-  const totalRegex = /(total|totaal|grand total)[^\d]{0,20}(\d+[.,]\d{2})/gi
-  const paymentMatch = transcript.match(paymentRegex)
-  if (paymentMatch) return parseFloat(paymentMatch[2].replace(',', '.'))
-  const totalMatches = [...transcript.matchAll(totalRegex)]
-  if (totalMatches.length > 0) {
-    const last = totalMatches[totalMatches.length - 1]
-    return parseFloat(last[2].replace(',', '.'))
-  }
-  return null
-}
-
-function calculateConfidence(result: ExtractedReceipt): number {
-  let score = 0
-  if (result.amount !== null) score += 30
-  if (result.merchant) score += 20
-  if (result.transaction_date) score += 15
-  if (result.currency) score += 10
-  if (result.city) score += 10
-  if (result.country) score += 5
-  if (result.category) score += 10
-  return score
-}
-
-function isProduction(): boolean {
-  const env = Deno.env.get('ENV') ?? Deno.env.get('NODE_ENV') ?? ''
-  return env.toLowerCase() === 'production'
-}
+Output: Reply with ONLY a single JSON object with these exact keys: full_text, ai_summary, amount, currency, merchant, category, description, transaction_date, city, country. No commentary. If something is truly unreadable or missing, use null for that field only.`
 
 // Convert PDF to PNG images via external API. Set PDF_CONVERT_API_URL (e.g. https://v2.convertapi.com/convert/pdf/to/png) and PDF_CONVERT_API_KEY (Secret).
 // Returns data URLs for each page; empty array if not configured or conversion fails.
@@ -378,207 +267,7 @@ async function convertPdfToImages(file: File): Promise<string[]> {
   }
 }
 
-// Step 1: Transcribe image(s) only. No schema. Returns plain text.
-async function transcribeImage(
-  apiKey: string,
-  content: Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }>
-): Promise<string | null> {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: TRANSCRIBE_SYSTEM },
-        { role: 'user', content },
-      ],
-      max_tokens: 8192,
-      temperature: 0,
-    }),
-  })
-  if (!response.ok) return null
-  const data = await response.json()
-  const text = data.choices?.[0]?.message?.content?.trim()
-  return text ?? null
-}
-
-// Step 2: Extract structured fields from transcript. System = rules + document type. Strict schema.
-async function extractFromTranscript(
-  apiKey: string,
-  transcript: string,
-  documentType: 'receipt' | 'invoice'
-): Promise<Omit<ExtractedReceipt, 'full_text' | 'amount_source'> | null> {
-  const docTypeLine = documentType === 'invoice'
-    ? 'Document type: INVOICE\n\nFor invoices: Prefer "Amount Due". Ignore line-item subtotal. Ignore VAT-only breakdown.'
-    : 'Document type: RECEIPT'
-  const systemContent = `${EXTRACTION_SYSTEM}\n\n${docTypeLine}`
-  const schema = {
-    type: 'object' as const,
-    properties: {
-      ai_summary: { type: 'string' as const },
-      amount: { type: 'number' as const },
-      currency: { type: 'string' as const },
-      merchant: { type: 'string' as const },
-      category: { type: 'string' as const },
-      description: { type: 'string' as const },
-      transaction_date: { type: 'string' as const },
-      city: { type: 'string' as const },
-      country: { type: 'string' as const },
-    },
-    required: [] as string[],
-    additionalProperties: false,
-  }
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: systemContent },
-        { role: 'user', content: `From this ${documentType} transcript, extract the requested fields. Do not guess.\n\nTranscript:\n${transcript.slice(0, 12000)}` },
-      ],
-      max_tokens: 2048,
-      temperature: 0,
-      response_format: {
-        type: 'json_schema',
-        json_schema: { name: 'receipt_fields', strict: true, schema },
-      },
-    }),
-  })
-  if (!response.ok) return null
-  const data = await response.json()
-  const raw = data.choices?.[0]?.message?.content?.trim()
-  if (!raw) return null
-  if (!isProduction()) {
-    console.log('[extract] Stage 2 raw JSON length:', raw.length)
-  }
-  try {
-    return JSON.parse(raw) as Omit<ExtractedReceipt, 'full_text' | 'amount_source'>
-  } catch {
-    const m = raw.match(/\{[\s\S]*\}/)
-    return m ? (JSON.parse(m[0]) as Omit<ExtractedReceipt, 'full_text' | 'amount_source'>) : null
-  }
-}
-
-// Amount-only retry when Stage 2 returned null amount but transcript has numbers.
-async function extractAmountOnly(apiKey: string, transcript: string): Promise<number | null> {
-  const schema = {
-    type: 'object' as const,
-    properties: { amount: { type: 'number' as const } },
-    required: [] as string[],
-    additionalProperties: false,
-  }
-  const system = `Extract ONLY the final paid amount from this transcript.
-Use payment-confirmed amount if available (BANCONTACT, VISA, TOTAL, TOTAAL, BETALING).
-Return JSON: {"amount": number}
-If uncertain, return {}.`
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: `Transcript:\n${transcript.slice(0, 8000)}` },
-      ],
-      max_tokens: 64,
-      temperature: 0,
-      response_format: {
-        type: 'json_schema',
-        json_schema: { name: 'amount_only', strict: true, schema },
-      },
-    }),
-  })
-  if (!response.ok) return null
-  const data = await response.json()
-  const raw = data.choices?.[0]?.message?.content?.trim()
-  if (!raw) return null
-  try {
-    const o = JSON.parse(raw) as { amount?: number }
-    if (typeof o?.amount === 'number' && !Number.isNaN(o.amount) && o.amount >= 0) return o.amount
-  } catch {
-    // ignore
-  }
-  return null
-}
-
-function parseExtractedFields(parsed: Record<string, unknown>): Omit<ExtractedReceipt, 'full_text' | 'amount_source'> {
-  const num = (v: unknown): number | null => {
-    if (typeof v === 'number' && !Number.isNaN(v)) return v
-    if (typeof v === 'string') {
-      const n = parseFloat(v.trim().replace(',', '.'))
-      return Number.isNaN(n) ? null : n
-    }
-    return null
-  }
-  const str = (v: unknown, max = 500): string | null =>
-    typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null
-  const dateStr = (v: unknown): string | null => {
-    if (typeof v !== 'string' || !v.trim()) return null
-    const d = new Date(v.trim())
-    return isNaN(d.getTime()) ? null : d.toISOString().split('T')[0]
-  }
-  let amount = num(parsed.amount)
-  if (amount !== null && amount < 0) amount = null
-  return {
-    ai_summary: str(parsed.ai_summary, 200),
-    amount,
-    currency: str(parsed.currency, 10),
-    merchant: str(parsed.merchant, 200),
-    category: str(parsed.category, 100),
-    description: str(parsed.description, 500),
-    transaction_date: dateStr(parsed.transaction_date),
-    city: str(parsed.city, 100),
-    country: str(parsed.country, 100),
-  }
-}
-
-// Apply heuristic fallback, confidence, amount-only retry, and dev-only logging.
-async function applyPostExtraction(
-  openaiApiKey: string,
-  transcript: string,
-  base: Omit<ExtractedReceipt, 'amount_source'> & { full_text: string },
-  fileSizeBytes?: number
-): Promise<ExtractedReceipt> {
-  const result: ExtractedReceipt = { ...base, amount_source: undefined }
-
-  if (result.amount === null) {
-    const heur = detectTotalHeuristic(transcript)
-    if (heur !== null) {
-      result.amount = heur
-      result.amount_source = 'heuristic'
-    }
-  }
-
-  let confidence = calculateConfidence(result)
-  if (confidence < 40) {
-    if (isProduction()) {
-      // Could call logError here if we had supabase/documentId; skip to avoid changing signature
-    } else {
-      console.log('[extract] Low confidence:', confidence, JSON.stringify(result))
-    }
-  }
-
-  if (result.amount === null && /\d+[.,]\d{2}/.test(transcript)) {
-    const retryAmount = await extractAmountOnly(openaiApiKey, transcript)
-    if (retryAmount !== null) {
-      result.amount = retryAmount
-      result.amount_source = 'retry'
-      confidence = calculateConfidence(result)
-    }
-  }
-
-  if (!isProduction()) {
-    console.log('[extract] File size (bytes):', fileSizeBytes ?? 'N/A')
-    console.log('[extract] Stage 1 transcript length:', transcript.length)
-    console.log('[extract] Final parsed:', JSON.stringify(result))
-    console.log('[extract] Confidence score:', confidence)
-  }
-
-  return result
-}
-
-// Two-stage when image(s) present: transcribe then extract. Single-stage when text only. System message for extraction rules.
+// Sends image(s) and/or OCR text to OpenAI; returns structured fields. No guessing. Supports: single image file, PDF pages (as image data URLs), or text only.
 async function extractWithOpenAI(
   file: File | null,
   pdfImageDataUrls: string[] | null,
@@ -589,42 +278,97 @@ async function extractWithOpenAI(
   const isImage = file && /^image\/(jpe?g|png|gif|webp)$/i.test(file.type?.toLowerCase() ?? '')
   const hasPdfImages = Array.isArray(pdfImageDataUrls) && pdfImageDataUrls.length > 0
   const hasVisual = isImage || hasPdfImages
-  const imageDetail = 'high' as const
   try {
-    if (hasVisual) {
-      const content: Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }> = [
-        { type: 'text', text: 'Transcribe this receipt or document.' },
-      ]
-      if (isImage && file) {
-        const buf = await file.arrayBuffer()
-        const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)))
-        content.push({ type: 'image_url', image_url: { url: `data:${file.type || 'image/jpeg'};base64,${base64}`, detail: imageDetail } })
-      } else if (hasPdfImages) {
-        for (const dataUrl of pdfImageDataUrls!) {
-          content.push({ type: 'image_url', image_url: { url: dataUrl, detail: imageDetail } })
-        }
-      }
-      const transcript = await transcribeImage(openaiApiKey, content)
-      if (!transcript || transcript.length < 2) return null
-      const documentType = classifyDocumentType(transcript)
-      const fields = await extractFromTranscript(openaiApiKey, transcript, documentType)
-      if (!fields) return null
-      const extracted = parseExtractedFields(fields as Record<string, unknown>)
-      const fullText = transcript.slice(0, 10000)
-      const baseResult = { full_text: fullText, ...extracted }
-      const fileSizeBytes = isImage && file ? file.size : undefined
-      return await applyPostExtraction(openaiApiKey, transcript, baseResult, fileSizeBytes)
+    // Build user message content (images + text) separately from system instructions
+    const userContent: Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }> = []
+
+    // User message is ONLY the data — no instructions mixed in
+    if (hasVisual && ocrText.trim()) {
+      userContent.push({
+        type: 'text',
+        text: `Extract all data from this receipt/document. The IMAGE is the primary source of truth.\n\nOptional OCR text from client (use only to help read unclear parts of the image — if it contradicts the image, ignore it):\n\n${ocrText.trim()}`,
+      })
+    } else if (hasVisual) {
+      userContent.push({ type: 'text', text: 'Extract all data from this receipt/document image.' })
+    } else if (ocrText.trim()) {
+      userContent.push({ type: 'text', text: `Extract all data from this receipt/document text. If something is unclear, use null.\n\n${ocrText.trim()}` })
+    } else {
+      return null
     }
-    if (!ocrText.trim()) return null
-    const transcript = ocrText.trim()
-    const documentType = classifyDocumentType(transcript)
-    const fields = await extractFromTranscript(openaiApiKey, transcript, documentType)
-    if (!fields) return null
-    const extracted = parseExtractedFields(fields as Record<string, unknown>)
-    const fullText = transcript.slice(0, 10000)
-    const baseResult = { full_text: fullText, ...extracted }
-    return await applyPostExtraction(openaiApiKey, transcript, baseResult)
-  } catch {
+
+    // Attach images
+    const imageDetail = 'high' as const
+    if (isImage && file) {
+      const buf = await file.arrayBuffer()
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)))
+      const mediaType = file.type || 'image/jpeg'
+      userContent.push({ type: 'image_url', image_url: { url: `data:${mediaType};base64,${base64}`, detail: imageDetail } })
+    } else if (hasPdfImages) {
+      for (const dataUrl of pdfImageDataUrls!) {
+        userContent.push({ type: 'image_url', image_url: { url: dataUrl, detail: imageDetail } })
+      }
+    }
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${openaiApiKey}` },
+      body: JSON.stringify({
+        model: 'gpt-4o',
+        messages: [
+          // System message: all instructions go here, separate from user data
+          { role: 'system', content: EXTRACTION_SYSTEM },
+          // User message: only the receipt data (text + images)
+          { role: 'user', content: userContent },
+        ],
+        max_tokens: 8192,
+        temperature: 0,
+        // Force valid JSON output — prevents markdown fences, commentary, malformed JSON
+        response_format: { type: 'json_object' },
+      }),
+    })
+    if (!response.ok) {
+      console.error('upload: OpenAI extraction failed', response.status, await response.text())
+      return null
+    }
+    const data = await response.json()
+    const raw = data.choices?.[0]?.message?.content?.trim()
+    if (!raw) return null
+    // With response_format: json_object, the response is guaranteed valid JSON
+    const parsed = JSON.parse(raw) as Record<string, unknown>
+    const num = (v: unknown): number | null => {
+      if (typeof v === 'number' && !Number.isNaN(v)) return v
+      if (typeof v === 'string') {
+        const normalized = v.trim().replace(',', '.')
+        const n = parseFloat(normalized)
+        return Number.isNaN(n) ? null : n
+      }
+      return null
+    }
+    const str = (v: unknown, max = 500): string | null =>
+      typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null
+    const dateStr = (v: unknown): string | null => {
+      if (typeof v !== 'string' || !v.trim()) return null
+      // Handle YYYY-MM-DD directly first
+      const isoMatch = v.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/)
+      if (isoMatch) return v.trim()
+      const d = new Date(v.trim())
+      if (isNaN(d.getTime())) return null
+      return d.toISOString().split('T')[0]
+    }
+    return {
+      full_text: str(parsed.full_text, 10000) ?? '',
+      ai_summary: str(parsed.ai_summary, 200),
+      amount: num(parsed.amount),
+      currency: str(parsed.currency, 10),
+      merchant: str(parsed.merchant, 200),
+      category: str(parsed.category, 100),
+      description: str(parsed.description, 500),
+      transaction_date: dateStr(parsed.transaction_date),
+      city: str(parsed.city, 100),
+      country: str(parsed.country, 100),
+    }
+  } catch (e) {
+    console.error('upload: extractWithOpenAI error', e)
     return null
   }
 }
@@ -719,7 +463,7 @@ Deno.serve(async (req) => {
     if (!isImage && !isPdf && ocrText.length === 0) {
       return new Response(
         JSON.stringify({
-          error: 'For non-image, non-PDF files send raw_text, extracted_text, or ocr_text. For images and PDFs we extract from the file only (no OCR needed).',
+          error: 'For non-image, non-PDF files send raw_text, extracted_text, or ocr_text. For images and PDFs you can also send OCR text; we use both document and text for higher accuracy.',
         }),
         { headers: { 'Content-Type': 'application/json' }, status: 400 },
       )
