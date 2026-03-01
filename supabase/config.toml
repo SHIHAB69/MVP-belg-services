@@ -107,12 +107,11 @@ enabled = true
 # The maximum file size allowed (e.g. "5MB", "500KB").
 file_size_limit = "50MiB"
 
-# Uncomment to configure local storage buckets
-# [storage.buckets.images]
-# public = false
-# file_size_limit = "50MiB"
-# allowed_mime_types = ["image/png", "image/jpeg"]
-# objects_path = "./images"
+# Storage bucket for uploaded receipts/documents (required for file_url to work)
+[storage.buckets.documents]
+public = true
+file_size_limit = "50MiB"
+allowed_mime_types = ["image/jpeg", "image/png", "image/webp", "image/avif", "application/pdf"]
 
 # Allow connections via S3 compatible clients
 [storage.s3_protocol]
@@ -396,7 +395,7 @@ entrypoint = "./functions/register/index.ts"
 
 [functions.upload]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/upload/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -407,7 +406,7 @@ entrypoint = "./functions/upload/index.ts"
 
 [functions.ask]
 enabled = true
-verify_jwt = true
+verify_jwt = false
 import_map = "./functions/ask/deno.json"
 # Uncomment to specify a custom file path to the entrypoint.
 # Supported file extensions are: .ts, .js, .mjs, .jsx, .tsx
@@ -415,3 +414,24 @@ entrypoint = "./functions/ask/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/ask/*.html" ]
+
+[functions.chat]
+enabled = true
+verify_jwt = false
+import_map = "./functions/chat/deno.json"
+entrypoint = "./functions/chat/index.ts"
+
+[functions.realtime-session]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/realtime-session/index.ts"
+
+[functions.documents]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/documents/index.ts"
+
+[functions.document-file]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/document-file/index.ts"

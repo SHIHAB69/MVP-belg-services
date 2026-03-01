@@ -241,7 +241,7 @@ async function callLLM(question: string, context: string): Promise<string> {
         messages: [
           {
             role: 'system',
-            content: `You are a helpful expense tracking assistant. Answer questions about the user's expenses based on the following context:\n\n${context}\n\nKeep answers concise and friendly.`
+            content: `You are a helpful expense tracking assistant. Answer ONLY from the data in the context below (from the user's uploaded documents). Never invent or guess numbers. If the context does not contain the requested information, say clearly that it is unavailable or missing. Give only a text answer; do not ask the app to filter or display things. Keep answers concise and friendly.\n\nContext:\n${context}`
           },
           {
             role: 'user',

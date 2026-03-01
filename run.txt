@@ -1,0 +1,5 @@
+cd /Users/sihab/Documents/MVP-belg-services
+supabase start
+
+cd /Users/sihab/Documents/MVP-belg-services
+supabase functions serve --no-verify-jwt --env-file .env.local

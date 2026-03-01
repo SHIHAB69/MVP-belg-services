@@ -20,6 +20,7 @@ CREATE TABLE documents (
     file_url TEXT,
     mime_type TEXT,
     file_size BIGINT,
+    ai_summary TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -47,6 +48,8 @@ CREATE TABLE transactions (
     category TEXT,
     description TEXT,
     transaction_date DATE,
+    city TEXT,
+    country TEXT,
     parser_version TEXT NOT NULL,
     prompt_version TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
