@@ -152,12 +152,22 @@ async function runSearchTransactions(
       city: t.city ?? null,
       country: t.country ?? null,
     }))
+    // Grand total computed from all matching rows (not just the shown slice)
+    const totals_by_currency: Record<string, number> = {}
+    for (const t of allRows) {
+      const currency = (t.currency ?? 'USD').toUpperCase()
+      totals_by_currency[currency] = Math.round(((totals_by_currency[currency] ?? 0) + parseFloat(t.amount)) * 100) / 100
+    }
     return {
       content: JSON.stringify({
         transactions,
+        totals_by_currency,
         total_matching: allRows.length,
         shown: transactions.length,
         documents_found,
+        ...(allRows.length > cap
+          ? { grand_total_note: `Totals cover all ${allRows.length} matching transactions, not just the ${cap} shown.` }
+          : {}),
       }),
     }
   }
@@ -174,7 +184,7 @@ async function runSearchTransactions(
     for (const t of allRows) {
       const currency = (t.currency ?? 'USD').toUpperCase()
       const amount = parseFloat(t.amount)
-      totals[currency] = (totals[currency] ?? 0) + amount
+      totals[currency] = Math.round(((totals[currency] ?? 0) + amount) * 100) / 100
       transactions.push({
         merchant: t.merchant ?? null,
         amount,
@@ -199,7 +209,7 @@ async function runSearchTransactions(
       const cat = t.category ?? 'Uncategorized'
       const currency = (t.currency ?? 'USD').toUpperCase()
       if (!grouped[cat]) grouped[cat] = {}
-      grouped[cat][currency] = (grouped[cat][currency] ?? 0) + parseFloat(t.amount)
+      grouped[cat][currency] = Math.round(((grouped[cat][currency] ?? 0) + parseFloat(t.amount)) * 100) / 100
     }
     const by_category = Object.entries(grouped).map(([cat, totals_by_currency]) => ({
       category: cat,
@@ -216,7 +226,7 @@ async function runSearchTransactions(
     const merch = t.merchant ?? 'Unknown'
     const currency = (t.currency ?? 'USD').toUpperCase()
     if (!grouped[merch]) grouped[merch] = {}
-    grouped[merch][currency] = (grouped[merch][currency] ?? 0) + parseFloat(t.amount)
+    grouped[merch][currency] = Math.round(((grouped[merch][currency] ?? 0) + parseFloat(t.amount)) * 100) / 100
   }
   const by_merchant = Object.entries(grouped).map(([merch, totals_by_currency]) => ({
     merchant: merch,
@@ -241,6 +251,15 @@ async function runGetDocumentsSummary(
     return { content: JSON.stringify({ error: error.message }) }
   }
   const documents_found = (docs ?? []).length
+  type TxSummary = {
+    amount?: string | null
+    currency?: string | null
+    merchant?: string | null
+    category?: string | null
+    transaction_date?: string | null
+    city?: string | null
+    country?: string | null
+  }
   const documents = (docs ?? []).map((d: {
     id: string
     ai_summary?: string | null
@@ -248,20 +267,35 @@ async function runGetDocumentsSummary(
     transactions?: unknown
   }) => {
     const raw = d.transactions
-    const tx = Array.isArray(raw) && raw.length > 0 ? raw[0] : null
+    const txList: TxSummary[] = Array.isArray(raw) ? (raw as TxSummary[]) : []
+    const firstTx = txList.length > 0 ? txList[0] : null
+
+    // Aggregate totals per currency across all transactions in this document
+    const total_amount_by_currency: Record<string, number> = {}
+    for (const t of txList) {
+      const currency = (t.currency ?? 'USD').toUpperCase()
+      total_amount_by_currency[currency] = Math.round(
+        ((total_amount_by_currency[currency] ?? 0) + parseFloat(t.amount ?? '0')) * 100
+      ) / 100
+    }
+
+    // Unique merchants across all transactions
+    const merchants = [...new Set(txList.map((t) => t.merchant).filter(Boolean))] as string[]
+
     return {
-      document_id: d.id,
       uploaded_at: d.created_at,
       ai_summary: d.ai_summary ?? null,
-      merchant: (tx as { merchant?: string | null } | null)?.merchant ?? null,
-      amount: (tx as { amount?: string | null } | null)?.amount
-        ? parseFloat((tx as { amount: string }).amount)
-        : null,
-      currency: (tx as { currency?: string | null } | null)?.currency ?? null,
-      category: (tx as { category?: string | null } | null)?.category ?? null,
-      transaction_date: (tx as { transaction_date?: string | null } | null)?.transaction_date ?? null,
-      city: (tx as { city?: string | null } | null)?.city ?? null,
-      country: (tx as { country?: string | null } | null)?.country ?? null,
+      transaction_count: txList.length,
+      total_amount_by_currency,
+      merchants,
+      // First transaction details for quick reference
+      merchant: firstTx?.merchant ?? null,
+      amount: firstTx?.amount ? parseFloat(firstTx.amount) : null,
+      currency: firstTx?.currency ?? null,
+      category: firstTx?.category ?? null,
+      transaction_date: firstTx?.transaction_date ?? null,
+      city: firstTx?.city ?? null,
+      country: firstTx?.country ?? null,
     }
   })
   return { content: JSON.stringify({ documents, documents_found }) }
@@ -375,18 +409,16 @@ Always use these exact pre-computed dates — never calculate your own:
 - All data is from uploaded receipts (expenses only — there is no income data).
 - For questions outside of finance/expenses, answer helpfully and naturally.
 
+## Critical rules — never break these
+1. Before answering ANY question involving amounts, spending, merchants, categories, dates, or receipts — ALWAYS call a tool first, even if you think you already know the answer. Never state a number, total, or transaction detail from memory.
+2. For follow-up questions ("what about last month?", "and for groceries?", "how about Uber?") — call search_transactions again with the updated filters. Do not reuse prior tool results.
+3. If the user asks about both a total AND wants to see the list — call search_transactions with aggregate="list". The result now includes "totals_by_currency" covering all matching rows, so you can report both the list and the total accurately.
+4. If a tool returns zero transactions, say so plainly. Do not guess or invent numbers.
+5. NEVER show internal IDs (document IDs, UUIDs, database keys) to the user — they are meaningless to them. Identify receipts by merchant, date, amount, and city/country instead.
+6. For duplicate receipt questions — call get_documents_summary, then group receipts by merchant+amount+date. Present each duplicate group using human-readable details: merchant name, amount, date, city/country, and ai_summary. Example: "Carrefour · EUR 45.20 · 2026-02-14 · Brussels — uploaded twice."
+
 ## Following user instructions
 If the user gives you a behavioural instruction during the conversation — such as "reply in French", "be more formal", "keep answers short", "act like a financial advisor" — follow it immediately and keep following it for the rest of the conversation. User instructions override the default tone and format rules above.`
-}
-
-// ---------------------------------------------------------------------------
-// Intent detection — only force a tool call when the message is data-related
-// ---------------------------------------------------------------------------
-
-function looksLikeDataQuery(text: string): boolean {
-  return /spend|spent|cost|paid|total|amount|transaction|receipt|document|upload|merchant|categor|how much|what did|show me|list|last month|this month|this year|history|budget|where did|breakdown|bought|purchase|expensive|cheapest/i.test(
-    text
-  )
 }
 
 // ---------------------------------------------------------------------------
@@ -412,20 +444,13 @@ async function chatWithTools(
 ): Promise<OpenAIMessage[]> {
   const all: OpenAIMessage[] = [{ role: 'system', content: systemPrompt }, ...messages]
 
-  // Only force a tool call on round 0 when the user is actually asking about data
-  const lastUserContent =
-    [...messages].reverse().find((m) => m.role === 'user')?.content ?? ''
-  const needsDataOnFirstRound = looksLikeDataQuery(
-    typeof lastUserContent === 'string' ? lastUserContent : ''
-  )
-
   for (let i = 0; i < 6; i++) {
     const reqBody = JSON.stringify({
       model: 'gpt-4o',
       messages: all,
       tools: OPENAI_TOOLS,
-      tool_choice: i === 0 && needsDataOnFirstRound ? 'required' : 'auto',
-      max_tokens: 1500,
+      tool_choice: 'auto',
+      max_tokens: 2500,
       temperature: 0.3,
     })
     // Retry once on 429 — wait the duration OpenAI specifies before retrying
@@ -584,7 +609,7 @@ Deno.serve(async (req) => {
 
     // Only pass user + assistant text messages — tool rounds are excluded to keep
     // token counts low. The assistant's text summary is sufficient context for
-    // follow-up questions, and tool_choice:'required' fetches fresh data each turn.
+    // follow-up questions, and the system prompt instructs GPT to always re-fetch.
     const openaiMessages: OpenAIMessage[] = rawMessages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({
