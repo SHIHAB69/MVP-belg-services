@@ -78,6 +78,18 @@ const OPENAI_TOOLS = [
 type ToolResult = { content: string }
 type AggregateMode = 'sum_by_currency' | 'group_by_category' | 'group_by_merchant' | 'list'
 
+// Normalize currency symbols to ISO codes so € and EUR are treated identically
+const CURRENCY_SYMBOL_MAP: Record<string, string> = {
+  '€': 'EUR', '$': 'USD', '£': 'GBP', '¥': 'JPY', '₹': 'INR',
+  '₩': 'KRW', '₺': 'TRY', '₴': 'UAH', '₦': 'NGN', '₫': 'VND',
+  '฿': 'THB', 'R$': 'BRL', 'kr': 'SEK', 'zł': 'PLN', 'Kč': 'CZK',
+}
+function normalizeCurrency(raw: string | null | undefined): string {
+  if (!raw) return 'USD'
+  const trimmed = raw.trim()
+  return (CURRENCY_SYMBOL_MAP[trimmed] ?? trimmed).toUpperCase()
+}
+
 // Shared helper: fetch all document IDs for a user (with count for diagnostics)
 async function getUserDocIds(
   supabase: ReturnType<typeof createClient>,
@@ -155,7 +167,7 @@ async function runSearchTransactions(
     // Grand total computed from all matching rows (not just the shown slice)
     const totals_by_currency: Record<string, number> = {}
     for (const t of allRows) {
-      const currency = (t.currency ?? 'USD').toUpperCase()
+      const currency = normalizeCurrency(t.currency)
       totals_by_currency[currency] = Math.round(((totals_by_currency[currency] ?? 0) + parseFloat(t.amount)) * 100) / 100
     }
     return {
@@ -182,7 +194,7 @@ async function runSearchTransactions(
       category: string | null
     }> = []
     for (const t of allRows) {
-      const currency = (t.currency ?? 'USD').toUpperCase()
+      const currency = normalizeCurrency(t.currency)
       const amount = parseFloat(t.amount)
       totals[currency] = Math.round(((totals[currency] ?? 0) + amount) * 100) / 100
       transactions.push({
@@ -207,7 +219,7 @@ async function runSearchTransactions(
     const grouped: Record<string, Record<string, number>> = {}
     for (const t of allRows) {
       const cat = t.category ?? 'Uncategorized'
-      const currency = (t.currency ?? 'USD').toUpperCase()
+      const currency = normalizeCurrency(t.currency)
       if (!grouped[cat]) grouped[cat] = {}
       grouped[cat][currency] = Math.round(((grouped[cat][currency] ?? 0) + parseFloat(t.amount)) * 100) / 100
     }
@@ -224,7 +236,7 @@ async function runSearchTransactions(
   const grouped: Record<string, Record<string, number>> = {}
   for (const t of allRows) {
     const merch = t.merchant ?? 'Unknown'
-    const currency = (t.currency ?? 'USD').toUpperCase()
+    const currency = normalizeCurrency(t.currency)
     if (!grouped[merch]) grouped[merch] = {}
     grouped[merch][currency] = Math.round(((grouped[merch][currency] ?? 0) + parseFloat(t.amount)) * 100) / 100
   }
@@ -260,12 +272,14 @@ async function runGetDocumentsSummary(
     city?: string | null
     country?: string | null
   }
-  const documents = (docs ?? []).map((d: {
+  type DocRow = {
     id: string
     ai_summary?: string | null
     created_at: string
     transactions?: unknown
-  }) => {
+  }
+
+  const documents = (docs ?? [] as DocRow[]).map((d: DocRow) => {
     const raw = d.transactions
     const txList: TxSummary[] = Array.isArray(raw) ? (raw as TxSummary[]) : []
     const firstTx = txList.length > 0 ? txList[0] : null
@@ -273,7 +287,7 @@ async function runGetDocumentsSummary(
     // Aggregate totals per currency across all transactions in this document
     const total_amount_by_currency: Record<string, number> = {}
     for (const t of txList) {
-      const currency = (t.currency ?? 'USD').toUpperCase()
+      const currency = normalizeCurrency(t.currency)
       total_amount_by_currency[currency] = Math.round(
         ((total_amount_by_currency[currency] ?? 0) + parseFloat(t.amount ?? '0')) * 100
       ) / 100
@@ -284,11 +298,9 @@ async function runGetDocumentsSummary(
 
     return {
       uploaded_at: d.created_at,
-      ai_summary: d.ai_summary ?? null,
       transaction_count: txList.length,
       total_amount_by_currency,
       merchants,
-      // First transaction details for quick reference
       merchant: firstTx?.merchant ?? null,
       amount: firstTx?.amount ? parseFloat(firstTx.amount) : null,
       currency: firstTx?.currency ?? null,
@@ -298,7 +310,10 @@ async function runGetDocumentsSummary(
       country: firstTx?.country ?? null,
     }
   })
-  return { content: JSON.stringify({ documents, documents_found }) }
+
+  return {
+    content: JSON.stringify({ documents, documents_found }),
+  }
 }
 
 async function executeTool(
@@ -405,6 +420,7 @@ Always use these exact pre-computed dates — never calculate your own:
 - Be natural and direct. Answer the question, then stop. No filler endings.
 - Plain text only — no markdown. No bold (**), no italics (*), no headers (#). Use plain dashes for lists.
 - Never mix currencies in a single total — always list them separately (e.g. EUR 173.87 · USD 25.97).
+- In this app, currency symbols and currency codes are the same thing. € = EUR, $ = USD, £ = GBP, ₹ = INR, and so on. Always treat them as identical — never say they are different.
 - If data is empty, say so plainly. Never fabricate or guess numbers.
 - All data is from uploaded receipts (expenses only — there is no income data).
 - For questions outside of finance/expenses, answer helpfully and naturally.
@@ -415,7 +431,14 @@ Always use these exact pre-computed dates — never calculate your own:
 3. If the user asks about both a total AND wants to see the list — call search_transactions with aggregate="list". The result now includes "totals_by_currency" covering all matching rows, so you can report both the list and the total accurately.
 4. If a tool returns zero transactions, say so plainly. Do not guess or invent numbers.
 5. NEVER show internal IDs (document IDs, UUIDs, database keys) to the user — they are meaningless to them. Identify receipts by merchant, date, amount, and city/country instead.
-6. For duplicate receipt questions — call get_documents_summary, then group receipts by merchant+amount+date. Present each duplicate group using human-readable details: merchant name, amount, date, city/country, and ai_summary. Example: "Carrefour · EUR 45.20 · 2026-02-14 · Brussels — uploaded twice."
+6. For duplicate detection questions ("show duplicates", "what's uploaded twice", "doubled entries", etc.) — call search_transactions with aggregate="list" and limit=50. This returns individual transactions in a flat list. Then compare every transaction against every other using merchant + amount + currency. Rules:
+   - Two transactions are duplicates if merchant + amount + currency all match.
+   - Minor category/city/country differences are fine — still flag as duplicate.
+   - NEVER use transaction_date to exclude — same receipt uploaded on different days still counts.
+   - Group all matching transactions together and report: merchant, amount, currency, category, date, city/country, and how many times it appears.
+   - Example: "Imran Travels Pvt Ltd · USD 907.00 · Travel · Dhaka, Bangladesh — appears 3 times."
+7. For questions about documents/receipts list ("what did I upload", "list my receipts") — call get_documents_summary.
+8. For follow-up questions like "show their details", "show their amounts" after a duplicate query — call search_transactions with aggregate="list" and limit=50 again.
 
 ## Following user instructions
 If the user gives you a behavioural instruction during the conversation — such as "reply in French", "be more formal", "keep answers short", "act like a financial advisor" — follow it immediately and keep following it for the rest of the conversation. User instructions override the default tone and format rules above.`
@@ -445,28 +468,31 @@ async function chatWithTools(
   const all: OpenAIMessage[] = [{ role: 'system', content: systemPrompt }, ...messages]
 
   for (let i = 0; i < 6; i++) {
-    const reqBody = JSON.stringify({
-      model: 'gpt-4o',
+    const buildReqBody = (model: string) => JSON.stringify({
+      model,
       messages: all,
       tools: OPENAI_TOOLS,
       tool_choice: 'auto',
       max_tokens: 2500,
       temperature: 0.3,
     })
-    // Retry once on 429 — wait the duration OpenAI specifies before retrying
-    let response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${openaiApiKey}` },
-      body: reqBody,
-    })
+    const callOpenAI = (model: string) =>
+      fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${openaiApiKey}` },
+        body: buildReqBody(model),
+      })
+
+    // Try gpt-4o first; on 429 fall back to gpt-4o-mini immediately
+    let response = await callOpenAI('gpt-4o')
+    if (response.status === 429) {
+      response = await callOpenAI('gpt-4o-mini')
+    }
+    // If mini also rate-limits, wait and retry mini once more
     if (response.status === 429) {
       const retryAfterMs = Math.ceil(parseFloat(response.headers.get('retry-after') ?? '3')) * 1000
       await new Promise((r) => setTimeout(r, retryAfterMs))
-      response = await fetch('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${openaiApiKey}` },
-        body: reqBody,
-      })
+      response = await callOpenAI('gpt-4o-mini')
     }
     if (!response.ok) {
       const errText = await response.text()
@@ -516,7 +542,13 @@ async function chatWithTools(
         continue
       }
       const result = await executeTool(name, args, supabase, userId)
-      all.push({ role: 'tool', content: result.content, tool_call_id: id, name })
+      // Cap tool result at ~12,000 chars (~3,000 tokens) to stay within TPM limits.
+      // If truncated, append a note so GPT knows the list was cut short.
+      const MAX_TOOL_CHARS = 12000
+      const toolContent = result.content.length > MAX_TOOL_CHARS
+        ? result.content.slice(0, MAX_TOOL_CHARS) + '"},"_note":"Result truncated to fit token limits. Ask the user to narrow the query if more data is needed."}'
+        : result.content
+      all.push({ role: 'tool', content: toolContent, tool_call_id: id, name })
     }
   }
   return all
@@ -610,11 +642,23 @@ Deno.serve(async (req) => {
     // Only pass user + assistant text messages — tool rounds are excluded to keep
     // token counts low. The assistant's text summary is sufficient context for
     // follow-up questions, and the system prompt instructs GPT to always re-fetch.
+    // Cap at last 10 messages to prevent unbounded history growth (large responses
+    // like transaction lists accumulate quickly and blow past token limits).
+    const MAX_HISTORY = 10
     const openaiMessages: OpenAIMessage[] = rawMessages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({
         role: m.role as 'user' | 'assistant',
         content: typeof m.content === 'string' ? m.content : '',
+      }))
+      .slice(-MAX_HISTORY)
+      .map((m) => ({
+        ...m,
+        // Truncate individual messages to 2000 chars to prevent a single huge
+        // transaction-list response from dominating the context window.
+        content: typeof m.content === 'string' && m.content.length > 2000
+          ? m.content.slice(0, 2000) + '… [truncated]'
+          : m.content,
       }))
 
     const resultMessages = await chatWithTools(
