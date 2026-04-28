@@ -1,9 +1,13 @@
+// TODO post-M2: extract coalesceNum/coalesceStr/flattenDocumentForChat/
+// CHAT_USER_DATA_SELECT to supabase/functions/_shared/user_data.ts
+// (also duplicated in ask/index.ts).
+
 // Setup type definitions for built-in Supabase Runtime APIs
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from 'jsr:@supabase/supabase-js@2'
 
 // ---------------------------------------------------------------------------
-// Tool names and definitions
+// Tool names and definitions (UNCHANGED from MVP -- byte-identical to GPT)
 // ---------------------------------------------------------------------------
 
 const TOOL_NAMES = [
@@ -72,7 +76,7 @@ const OPENAI_TOOLS = [
 ]
 
 // ---------------------------------------------------------------------------
-// Tool execution (Supabase)
+// Tool execution helpers
 // ---------------------------------------------------------------------------
 
 type ToolResult = { content: string }
@@ -90,30 +94,89 @@ function normalizeCurrency(raw: string | null | undefined): string {
   return (CURRENCY_SYMBOL_MAP[trimmed] ?? trimmed).toUpperCase()
 }
 
-// Shared helper: fetch all document IDs for a user (with count for diagnostics)
-async function getUserDocIds(
+// OCR convention: prefer human-edited *_corrected, fall back to extractor *_ocr.
+function coalesceNum(corrected: unknown, ocr: unknown): number {
+  const v = corrected ?? ocr
+  if (v === null || v === undefined) return 0
+  const n = Number(v)
+  return Number.isNaN(n) ? 0 : n
+}
+function coalesceStr(corrected: unknown, ocr: unknown): string | null {
+  const v = corrected ?? ocr
+  return (typeof v === 'string' && v.length > 0) ? v : null
+}
+
+// Flat per-transaction record assembled from the JOINed embed.
+type FlatTxChat = {
+  amount: number
+  currency: string | null   // RAW (not normalized) -- normalize at the call site that needs it
+  merchant: string | null
+  category: string | null
+  description: string | null
+  transaction_date: string | null
+  city: string | null
+  country: string | null
+}
+
+function flattenDocumentForChat(d: any): FlatTxChat[] {
+  const txArr: any[] = Array.isArray(d.transactions) ? d.transactions : (d.transactions ? [d.transactions] : [])
+  const receipt = Array.isArray(d.receipts) ? (d.receipts[0] ?? null) : (d.receipts ?? null)
+  const invoice = Array.isArray(d.invoices) ? (d.invoices[0] ?? null) : (d.invoices ?? null)
+  const subtype = receipt ?? invoice
+  const store = receipt?.stores ?? null               // invoices have no store yet (Decision 14)
+  return txArr.map((tx: any) => ({
+    amount:           coalesceNum(tx.amount_corrected,           tx.amount_ocr),
+    currency:         coalesceStr(tx.currency_corrected,         tx.currency_ocr),       // raw, not normalized
+    merchant:         coalesceStr(store?.name_corrected,         store?.name_ocr),
+    category:         coalesceStr(subtype?.category_corrected,   subtype?.category_ocr),
+    description:      coalesceStr(subtype?.description_corrected, subtype?.description_ocr),
+    transaction_date: coalesceStr(tx.transaction_date_corrected, tx.transaction_date_ocr),
+    city:             store?.city_name_ocr ?? null,            // scaffolding column; no _corrected pair
+    country:          store?.country_name_ocr ?? null,
+  }))
+}
+
+// One-round-trip embed -- documents + their transactions + subtype + store.
+// ai_summary_* are fetched but only used by get_documents_summary's per-doc
+// aggregation block (currently NOT exposed in the output -- preserves MVP bug
+// behavior; see note in runGetDocumentsSummary below).
+const CHAT_USER_DATA_SELECT = `
+  id, ai_summary_ocr, ai_summary_corrected, created_at,
+  transactions (
+    amount_ocr, amount_corrected,
+    currency_ocr, currency_corrected,
+    transaction_date_ocr, transaction_date_corrected
+  ),
+  receipts (
+    category_ocr, category_corrected,
+    description_ocr, description_corrected,
+    stores (
+      name_ocr, name_corrected,
+      city_name_ocr, country_name_ocr
+    )
+  ),
+  invoices (
+    category_ocr, category_corrected,
+    description_ocr, description_corrected
+  )
+`
+
+async function fetchUserDocsForChat(
   supabase: ReturnType<typeof createClient>,
-  userId: string
-): Promise<{ docIds: string[]; documents_found: number }> {
-  const { data: docs } = await supabase
-    .from('documents')
-    .select('id')
-    .eq('user_id', userId)
-  const docIds = (docs ?? []).map((d: { id: string }) => d.id)
-  return { docIds, documents_found: docIds.length }
+  userId: string,
+  options: { orderRecentDesc?: boolean; limit?: number } = {}
+) {
+  let q = supabase.from('documents').select(CHAT_USER_DATA_SELECT).eq('user_id', userId)
+  if (options.orderRecentDesc) q = q.order('created_at', { ascending: false })
+  if (options.limit) q = q.limit(options.limit)
+  const { data, error } = await q
+  if (error) throw error
+  return data ?? []
 }
 
-type TxRow = {
-  amount: string
-  currency?: string | null
-  merchant?: string | null
-  category?: string | null
-  transaction_date?: string | null
-  description?: string | null
-  city?: string | null
-  country?: string | null
-}
-
+// ---------------------------------------------------------------------------
+// Tool: search_transactions
+// ---------------------------------------------------------------------------
 async function runSearchTransactions(
   supabase: ReturnType<typeof createClient>,
   userId: string,
@@ -124,8 +187,10 @@ async function runSearchTransactions(
   aggregate: AggregateMode,
   limit: number
 ): Promise<ToolResult> {
-  const { docIds, documents_found } = await getUserDocIds(supabase, userId)
-  if (!docIds.length) {
+  // One round trip: documents + their transactions + receipts/invoices + stores.
+  const docs = await fetchUserDocsForChat(supabase, userId)
+  const documents_found = docs.length
+  if (documents_found === 0) {
     return {
       content: JSON.stringify({
         result: null,
@@ -135,50 +200,60 @@ async function runSearchTransactions(
     }
   }
 
-  let query = supabase
-    .from('transactions')
-    .select('amount, currency, merchant, category, transaction_date, description, city, country')
-    .in('document_id', docIds)
-    .order('transaction_date', { ascending: false })
+  // Flatten documents into MVP-shaped transaction records.
+  const allFlat = docs.flatMap(flattenDocumentForChat)
 
-  // All filters applied in SQL — no client-side filtering
-  if (merchant) query = query.ilike('merchant', `%${merchant}%`)
-  if (category) query = query.ilike('category', `%${category}%`)
-  if (startDate) query = query.gte('transaction_date', startDate)
-  if (endDate) query = query.lte('transaction_date', endDate)
+  // Filters moved from SQL to JS so they observe COALESCE(_corrected, _ocr)
+  // semantics. Same observable behaviour as the old .ilike / .gte / .lte.
+  let filtered = allFlat
+  if (merchant) {
+    const needle = merchant.toLowerCase()
+    filtered = filtered.filter(t => (t.merchant ?? '').toLowerCase().includes(needle))
+  }
+  if (category) {
+    const needle = category.toLowerCase()
+    filtered = filtered.filter(t => (t.category ?? '').toLowerCase().includes(needle))
+  }
+  if (startDate) {
+    filtered = filtered.filter(t => t.transaction_date !== null && t.transaction_date >= startDate)
+  }
+  if (endDate) {
+    filtered = filtered.filter(t => t.transaction_date !== null && t.transaction_date <= endDate)
+  }
 
-  const { data: rows, error } = await query
-  if (error) return { content: JSON.stringify({ error: error.message }) }
-
-  const allRows = (rows ?? []) as TxRow[]
+  // Sort by transaction_date desc (matches old .order('transaction_date', desc)).
+  // Nulls sort last via empty-string fallback.
+  filtered.sort((a, b) => (b.transaction_date ?? '').localeCompare(a.transaction_date ?? ''))
 
   if (aggregate === 'list') {
     const cap = Math.min(200, Math.max(1, Math.round(limit)))
-    const transactions = allRows.slice(0, cap).map((t) => ({
-      amount: parseFloat(t.amount),
-      currency: t.currency ?? null,
-      merchant: t.merchant ?? null,
-      category: t.category ?? null,
-      transaction_date: t.transaction_date ?? null,
-      description: t.description ?? null,
-      city: t.city ?? null,
-      country: t.country ?? null,
+    // PRESERVED QUIRK: per-row 'currency' here is the RAW value (not normalized).
+    // totals_by_currency below uses NORMALIZED currency. Matches MVP byte-for-byte.
+    const transactions = filtered.slice(0, cap).map(t => ({
+      amount: t.amount,
+      currency: t.currency,
+      merchant: t.merchant,
+      category: t.category,
+      transaction_date: t.transaction_date,
+      description: t.description,
+      city: t.city,
+      country: t.country,
     }))
-    // Grand total computed from all matching rows (not just the shown slice)
+    // Grand totals across ALL matching rows, not just the shown slice.
     const totals_by_currency: Record<string, number> = {}
-    for (const t of allRows) {
+    for (const t of filtered) {
       const currency = normalizeCurrency(t.currency)
-      totals_by_currency[currency] = Math.round(((totals_by_currency[currency] ?? 0) + parseFloat(t.amount)) * 100) / 100
+      totals_by_currency[currency] = Math.round(((totals_by_currency[currency] ?? 0) + t.amount) * 100) / 100
     }
     return {
       content: JSON.stringify({
         transactions,
         totals_by_currency,
-        total_matching: allRows.length,
+        total_matching: filtered.length,
         shown: transactions.length,
         documents_found,
-        ...(allRows.length > cap
-          ? { grand_total_note: `Totals cover all ${allRows.length} matching transactions, not just the ${cap} shown.` }
+        ...(filtered.length > cap
+          ? { grand_total_note: `Totals cover all ${filtered.length} matching transactions, not just the ${cap} shown.` }
           : {}),
       }),
     }
@@ -193,16 +268,15 @@ async function runSearchTransactions(
       date: string | null
       category: string | null
     }> = []
-    for (const t of allRows) {
+    for (const t of filtered) {
       const currency = normalizeCurrency(t.currency)
-      const amount = parseFloat(t.amount)
-      totals[currency] = Math.round(((totals[currency] ?? 0) + amount) * 100) / 100
+      totals[currency] = Math.round(((totals[currency] ?? 0) + t.amount) * 100) / 100
       transactions.push({
-        merchant: t.merchant ?? null,
-        amount,
-        currency,
-        date: t.transaction_date ?? null,
-        category: t.category ?? null,
+        merchant: t.merchant,
+        amount: t.amount,
+        currency,                 // NORMALIZED here (preserved MVP shape)
+        date: t.transaction_date,
+        category: t.category,
       })
     }
     return {
@@ -217,93 +291,77 @@ async function runSearchTransactions(
 
   if (aggregate === 'group_by_category') {
     const grouped: Record<string, Record<string, number>> = {}
-    for (const t of allRows) {
+    for (const t of filtered) {
       const cat = t.category ?? 'Uncategorized'
       const currency = normalizeCurrency(t.currency)
       if (!grouped[cat]) grouped[cat] = {}
-      grouped[cat][currency] = Math.round(((grouped[cat][currency] ?? 0) + parseFloat(t.amount)) * 100) / 100
+      grouped[cat][currency] = Math.round(((grouped[cat][currency] ?? 0) + t.amount) * 100) / 100
     }
     const by_category = Object.entries(grouped).map(([cat, totals_by_currency]) => ({
       category: cat,
       totals_by_currency,
     }))
     return {
-      content: JSON.stringify({ by_category, transaction_count: allRows.length, documents_found }),
+      content: JSON.stringify({ by_category, transaction_count: filtered.length, documents_found }),
     }
   }
 
-  // group_by_merchant
+  // aggregate === 'group_by_merchant'
   const grouped: Record<string, Record<string, number>> = {}
-  for (const t of allRows) {
+  for (const t of filtered) {
     const merch = t.merchant ?? 'Unknown'
     const currency = normalizeCurrency(t.currency)
     if (!grouped[merch]) grouped[merch] = {}
-    grouped[merch][currency] = Math.round(((grouped[merch][currency] ?? 0) + parseFloat(t.amount)) * 100) / 100
+    grouped[merch][currency] = Math.round(((grouped[merch][currency] ?? 0) + t.amount) * 100) / 100
   }
   const by_merchant = Object.entries(grouped).map(([merch, totals_by_currency]) => ({
     merchant: merch,
     totals_by_currency,
   }))
   return {
-    content: JSON.stringify({ by_merchant, transaction_count: allRows.length, documents_found }),
+    content: JSON.stringify({ by_merchant, transaction_count: filtered.length, documents_found }),
   }
 }
 
+// ---------------------------------------------------------------------------
+// Tool: get_documents_summary
+// ---------------------------------------------------------------------------
+// PRESERVED MVP BUG: ai_summary is SELECTed (CHAT_USER_DATA_SELECT) but NOT
+// exposed in the per-document output object. The tool description tells GPT
+// it returns ai_summary, but the implementation never includes it. Preserved
+// verbatim per Decision (no behaviour change in M2). Add to per-doc output
+// post-M2 if/when the tool description is cleaned up.
 async function runGetDocumentsSummary(
   supabase: ReturnType<typeof createClient>,
   userId: string
 ): Promise<ToolResult> {
-  const { data: docs, error } = await supabase
-    .from('documents')
-    .select('id, ai_summary, created_at, transactions(amount, currency, merchant, category, transaction_date, city, country)')
-    .eq('user_id', userId)
-    .order('created_at', { ascending: false })
-    .limit(50)
-  if (error) {
-    return { content: JSON.stringify({ error: error.message }) }
-  }
-  const documents_found = (docs ?? []).length
-  type TxSummary = {
-    amount?: string | null
-    currency?: string | null
-    merchant?: string | null
-    category?: string | null
-    transaction_date?: string | null
-    city?: string | null
-    country?: string | null
-  }
-  type DocRow = {
-    id: string
-    ai_summary?: string | null
-    created_at: string
-    transactions?: unknown
-  }
+  const docs = await fetchUserDocsForChat(supabase, userId, { orderRecentDesc: true, limit: 50 })
+  const documents_found = docs.length
 
-  const documents = (docs ?? [] as DocRow[]).map((d: DocRow) => {
-    const raw = d.transactions
-    const txList: TxSummary[] = Array.isArray(raw) ? (raw as TxSummary[]) : []
-    const firstTx = txList.length > 0 ? txList[0] : null
+  const documents = docs.map((d: any) => {
+    const txs = flattenDocumentForChat(d)
+    const firstTx = txs.length > 0 ? txs[0] : null
 
-    // Aggregate totals per currency across all transactions in this document
+    // Aggregate per-document totals across all transactions (matches MVP).
     const total_amount_by_currency: Record<string, number> = {}
-    for (const t of txList) {
+    for (const t of txs) {
       const currency = normalizeCurrency(t.currency)
       total_amount_by_currency[currency] = Math.round(
-        ((total_amount_by_currency[currency] ?? 0) + parseFloat(t.amount ?? '0')) * 100
+        ((total_amount_by_currency[currency] ?? 0) + t.amount) * 100
       ) / 100
     }
 
-    // Unique merchants across all transactions
-    const merchants = [...new Set(txList.map((t) => t.merchant).filter(Boolean))] as string[]
+    // Unique non-null merchants across all transactions on this document.
+    const merchants = [...new Set(txs.map(t => t.merchant).filter((m): m is string => m !== null))]
 
     return {
       uploaded_at: d.created_at,
-      transaction_count: txList.length,
+      transaction_count: txs.length,
       total_amount_by_currency,
       merchants,
       merchant: firstTx?.merchant ?? null,
-      amount: firstTx?.amount ? parseFloat(firstTx.amount) : null,
-      currency: firstTx?.currency ?? null,
+      amount: firstTx?.amount ?? null,
+      currency: firstTx?.currency ?? null,           // RAW, matches MVP (which returned t.currency directly)
       category: firstTx?.category ?? null,
       transaction_date: firstTx?.transaction_date ?? null,
       city: firstTx?.city ?? null,
@@ -316,6 +374,9 @@ async function runGetDocumentsSummary(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Tool dispatch (UNCHANGED from MVP)
+// ---------------------------------------------------------------------------
 async function executeTool(
   name: string,
   args: Record<string, unknown>,
@@ -361,7 +422,7 @@ async function executeTool(
 }
 
 // ---------------------------------------------------------------------------
-// System prompt (pre-computed date ranges injected)
+// System prompt (UNCHANGED from MVP -- pre-computed date ranges injected)
 // ---------------------------------------------------------------------------
 
 function buildSystemPrompt(): string {
@@ -445,7 +506,7 @@ If the user gives you a behavioural instruction during the conversation — such
 }
 
 // ---------------------------------------------------------------------------
-// Chat with tools (OpenAI)
+// Chat with tools (OpenAI) -- UNCHANGED from MVP
 // ---------------------------------------------------------------------------
 
 type OpenAIMessage =
@@ -581,7 +642,7 @@ async function textToSpeechBase64(apiKey: string, text: string): Promise<string 
 }
 
 // ---------------------------------------------------------------------------
-// Handler
+// Handler (UNCHANGED from MVP)
 // ---------------------------------------------------------------------------
 
 Deno.serve(async (req) => {
@@ -639,7 +700,7 @@ Deno.serve(async (req) => {
       ? `${buildSystemPrompt()}\n\n## Custom instructions\n${customInstructions}`
       : buildSystemPrompt()
 
-    // Only pass user + assistant text messages — tool rounds are excluded to keep
+    // Only pass user + assistant text messages -- tool rounds are excluded to keep
     // token counts low. The assistant's text summary is sufficient context for
     // follow-up questions, and the system prompt instructs GPT to always re-fetch.
     // Cap at last 10 messages to prevent unbounded history growth (large responses

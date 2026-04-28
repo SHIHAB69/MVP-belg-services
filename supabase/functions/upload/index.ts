@@ -18,31 +18,53 @@ function toBase64(buf: ArrayBuffer): string {
 type ExtractedReceipt = {
   full_text: string
   ai_summary: string | null
-  amount: number | null
+  amount: number | null          // total (net + tax), after discounts
+  net_amount: number | null
+  tax_amount: number | null
+  discount_amount: number        // 0 if no discount
+  paid_amount: number | null
   currency: string | null
   merchant: string | null
+  document_type: string | null   // "receipt" | "invoice" | "other"
+  address: string | null
   category: string | null
   description: string | null
   transaction_date: string | null
   city: string | null
   country: string | null
+  payment_method: string | null
+  payment_status: string | null
+  line_items: Array<{
+    quantity: number
+    product_name: string
+    unit_price: number
+    total_price: number
+  }>
 }
 
-const EXTRACTION_SYSTEM = `You are a receipt/document extraction system. Your goal is to extract information with maximum accuracy (match exactly what is on the document).
+const EXTRACTION_SYSTEM = `You are a receipt/document extraction system. Extract all fields with maximum accuracy from the document.
 
-Rules:
-- full_text: Transcribe ALL visible text from the receipt/document in order. Preserve line breaks. Include every line item, price, total, date, store name, address. Do not summarize or omit. Use the exact characters (numbers, commas, dots) as shown. For European receipts use comma as decimal separator in the text if that is what is printed (e.g. 173,87).
-- amount: The final total amount paid (the main total/totaal/TOTAL/BETALING line). Convert to a number with a dot for decimals (e.g. 173.87). If the receipt shows 173,87 or 173.87 use 173.87. Only the final paid total, not subtotals or line items.
-- currency: From the document (e.g. EUR, €, USD). Belgium/Netherlands/France/Germany/Spain/Italy → EUR. UK → GBP. US → USD. Canada → CAD.
-- transaction_date: The date on the receipt (sale or payment date). Convert to YYYY-MM-DD (e.g. 19/01/20 → 2020-01-19, 28-02-2026 → 2026-02-28).
-- merchant: The exact store or business name as printed (e.g. AD DOK NOORD, Best Buy). First line of the receipt or the clear store name.
-- city: From the address if present (e.g. GENT, Brussels). One word or short phrase.
-- country: From the address or infer from context (e.g. Belgium, Netherlands, USA).
-- category: One short label (e.g. Groceries, Supermarket, Electronics, Restaurant). No amount in category.
-- ai_summary: One short label for the type of receipt (e.g. Groceries, Supermarket). Must NOT include amount or currency.
-- description: Optional short description of what was bought (e.g. "Groceries and household items"); or null. Do not put the full item list here.
+Output: Reply with ONLY a single JSON object with these exact keys. No commentary. Use null for any field that is truly not present or unreadable.
 
-Output: Reply with ONLY a single JSON object with these exact keys: full_text, ai_summary, amount, currency, merchant, category, description, transaction_date, city, country. No commentary. If something is truly unreadable or missing, use null for that field only.`
+- full_text: Transcribe ALL visible text from the document in order. Preserve line breaks. Include every line item, price, total, date, store name, address. Do not summarize or omit. Use exact characters as shown on the document.
+- document_type: Exactly one of "receipt", "invoice", "other". receipt = issued by merchant at/shortly after purchase with ≥1 line item. invoice = issued by seller requesting payment with a unique invoice number and payment terms. other = anything else.
+- merchant: The commercial name as perceived by the end user. For physical shops: the specific shop name. For web purchases: brand or webshop name. For invoices: legal entity name on the invoice.
+- address: The address where goods/services were bought or the issuer's address. One line of text. null if not present.
+- city: City of purchase or issuer (e.g. GENT, Brussels, San Francisco). null if not present.
+- country: Country of purchase or issuer (e.g. Belgium, USA). null if not present.
+- currency: ISO 4217 code (e.g. EUR, USD, GBP). Belgium/Netherlands/France/Germany/Spain/Italy → EUR. UK → GBP. US → USD. Canada → CAD. null if not determinable.
+- transaction_date: The date the document was issued (NOT the upload date, NOT the payment date). Format as ISO 8601. Include time if present on the document (e.g. "2026-03-05T14:30:00"), otherwise date only (e.g. "2026-03-05"). Convert formats: 19/01/20 → 2020-01-19, 28-02-2026 → 2026-02-28.
+- net_amount: Total for all goods/services BEFORE tax, after discounts, excluding already-paid amounts. Decimal with dot separator. null if not determinable.
+- tax_amount: Total tax (VAT) on all goods/services, after discounts, excluding already-paid amounts. null if not determinable.
+- amount: Total amount to be paid (net + tax), after discounts, excluding already-paid amounts. This is the main total/TOTAL/BETALING line. Convert to decimal with dot separator (e.g. 173,87 → 173.87).
+- discount_amount: Total discount across all items. Use 0 if no discount is present — never null.
+- paid_amount: Amount already paid on this document. null if not determinable or not applicable.
+- payment_method: Exactly one of "cash", "debit_card", "credit_card", "mobile_payment", "bank_transfer", "not_paid", "other". null if not determinable.
+- payment_status: Exactly one of "completed", "not_paid", "other". null if not determinable.
+- category: One short label (e.g. Groceries, Restaurant, Electronics, Travel). No amount in category.
+- description: Optional short description of what was bought (e.g. "Groceries and household items"). null if not useful.
+- line_items: Array of all products/services on the document reflected in the total price. Each item: { "quantity": number, "product_name": string, "unit_price": number, "total_price": number }. unit_price = price for 1 unit including tax and any discount for that item. total_price = quantity × unit_price. Use empty array [] if no line items are present.
+- ai_summary: Any relevant information about this document NOT captured in the fields above. null if nothing to add.`
 
 // Upload a file to the OpenAI Files API.
 // Returns the file_id on success, or null on failure.
@@ -202,22 +224,51 @@ async function extractWithOpenAI(
       typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null
     const dateStr = (v: unknown): string | null => {
       if (typeof v !== 'string' || !v.trim()) return null
-      if (/^\d{4}-\d{2}-\d{2}$/.test(v.trim())) return v.trim()
-      const d = new Date(v.trim())
-      return isNaN(d.getTime()) ? null : d.toISOString().split('T')[0]
+      const s = v.trim()
+      // Accept ISO 8601 date (YYYY-MM-DD) or datetime (YYYY-MM-DDThh:mm or YYYY-MM-DDThh:mm:ss) as-is
+      if (/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$/.test(s)) return s
+      const d = new Date(s)
+      return isNaN(d.getTime()) ? null : d.toISOString().replace(/\.\d{3}Z$/, '')
     }
+
+    // Parse line_items array safely
+    const rawLineItems = parsed.line_items
+    const lineItems: Array<{ quantity: number; product_name: string; unit_price: number; total_price: number }> =
+      Array.isArray(rawLineItems)
+        ? rawLineItems
+            .map((item: unknown) => {
+              if (typeof item !== 'object' || item === null) return null
+              const i = item as Record<string, unknown>
+              const q = num(i.quantity)
+              const pn = str(i.product_name, 500)
+              const up = num(i.unit_price)
+              const tp = num(i.total_price)
+              if (q === null || !pn || up === null || tp === null) return null
+              return { quantity: q, product_name: pn, unit_price: up, total_price: tp }
+            })
+            .filter((i): i is { quantity: number; product_name: string; unit_price: number; total_price: number } => i !== null)
+        : []
 
     return {
       full_text: str(parsed.full_text, 10000) ?? '',
-      ai_summary: str(parsed.ai_summary, 200),
+      ai_summary: str(parsed.ai_summary, 1000),
       amount: num(parsed.amount),
+      net_amount: num(parsed.net_amount),
+      tax_amount: num(parsed.tax_amount),
+      discount_amount: num(parsed.discount_amount) ?? 0,
+      paid_amount: num(parsed.paid_amount),
       currency: str(parsed.currency, 10),
       merchant: str(parsed.merchant, 200),
+      document_type: str(parsed.document_type, 50),
+      address: str(parsed.address, 500),
       category: str(parsed.category, 100),
       description: str(parsed.description, 500),
       transaction_date: dateStr(parsed.transaction_date),
       city: str(parsed.city, 100),
       country: str(parsed.country, 100),
+      payment_method: str(parsed.payment_method, 50),
+      payment_status: str(parsed.payment_status, 50),
+      line_items: lineItems,
     }
   } catch (e) {
     console.error('upload: extractWithOpenAI error', e)
@@ -307,6 +358,7 @@ Deno.serve(async (req) => {
         file_url: urlData.publicUrl,
         mime_type: file.type || null,
         file_size: file.size,
+        extraction_status: 'pending',         // explicit; column DEFAULT would set this anyway
       })
       .select('id')
       .single()
@@ -343,49 +395,70 @@ Deno.serve(async (req) => {
       await deleteOpenAIFile(openAiFileId, openaiApiKey)
     }
 
+    // ----------------------------------------------------------------------
+    // Database fan-out (atomic via stored procedure).
+    // ----------------------------------------------------------------------
+    // The upload_extraction_fan_out() function (see m2_11 migration) wraps
+    // the UPDATE documents + store/payment_method lookup-or-insert + subtype
+    // INSERT + transaction INSERT + line_items expansion in a single Postgres
+    // transaction. Any failure inside rolls back atomically; we then mark the
+    // document 'failed' (separate write) so M3 re-extraction knows to retry it.
+    //
+    // Pre-extraction documents row already exists with extraction_status='pending'
+    // (set by the INSERT above). The function flips it to 'completed' on success.
     let transactionCreated = false
     let aiSummaryStored = false
 
     if (extracted) {
-      // Save OCR/full text result
-      const { error: ocrError } = await supabase.from('ocr_results').insert({
-        document_id: documentId,
-        raw_text: extracted.full_text || '',
-        ocr_version: '2.0.0',
+      const { data: rpcData, error: rpcError } = await supabase.rpc('upload_extraction_fan_out', {
+        p_document_id:      documentId,
+        p_user_id:          userId,
+        p_full_text:        extracted.full_text,
+        p_ai_summary:       extracted.ai_summary,
+        p_document_type:    extracted.document_type,
+        p_amount:           extracted.amount,
+        p_net_amount:       extracted.net_amount,
+        p_tax_amount:       extracted.tax_amount,
+        p_discount_amount:  extracted.discount_amount,
+        p_paid_amount:      extracted.paid_amount,
+        p_currency:         extracted.currency ?? 'EUR',
+        p_merchant:         extracted.merchant,
+        p_address:          extracted.address,
+        p_city:             extracted.city,
+        p_country:          extracted.country,
+        p_category:         extracted.category,
+        p_description:      extracted.description,
+        p_transaction_date: extracted.transaction_date,
+        p_payment_method:   extracted.payment_method,
+        p_payment_status:   extracted.payment_status,
+        p_line_items:       extracted.line_items,
       })
-      if (ocrError) {
-        await logError(supabase, documentId, userId, 'OCR_SAVE_ERROR', ocrError.message, undefined, { rawTextLength: extracted.full_text?.length ?? 0 })
-      }
 
-      // Save AI summary to documents table
-      if (extracted.ai_summary) {
-        const { error: updateErr } = await supabase
-          .from('documents')
-          .update({ ai_summary: extracted.ai_summary })
+      if (rpcError) {
+        // Fan-out rolled back atomically inside the function. Flip the
+        // document to 'failed' so M3 re-extraction targets it. This UPDATE
+        // is a separate (non-atomic) write -- if it also fails, the document
+        // stays in 'pending' state and M3 can still detect/retry.
+        await supabase.from('documents')
+          .update({ extraction_status: 'failed' })
           .eq('id', documentId)
-        if (!updateErr) aiSummaryStored = true
-        else await logError(supabase, documentId, userId, 'AI_SUMMARY_UPDATE_ERROR', updateErr.message)
-      }
-
-      // Create transaction only when OpenAI returned an amount
-      if (extracted.amount !== null) {
-        const { error: transactionError } = await supabase.from('transactions').insert({
-          document_id: documentId,
-          amount: extracted.amount,
-          currency: extracted.currency ?? 'EUR',
-          merchant: extracted.merchant,
-          category: extracted.category,
-          description: extracted.description,
-          transaction_date: extracted.transaction_date,
-          city: extracted.city,
-          country: extracted.country,
-          parser_version: '2.0.0',
-          prompt_version: '2.0.0',
-        })
-        if (!transactionError) transactionCreated = true
-        else await logError(supabase, documentId, userId, 'TRANSACTION_CREATE_ERROR', transactionError.message)
+        await logError(
+          supabase, documentId, userId,
+          'FAN_OUT_FAILED',
+          rpcError.message,
+          undefined,
+          { hasLineItems: extracted.line_items.length > 0, hasAmount: extracted.amount !== null }
+        )
+      } else {
+        const row = Array.isArray(rpcData) && rpcData.length > 0 ? rpcData[0] : null
+        transactionCreated = row?.transaction_created === true
+        aiSummaryStored    = row?.ai_summary_stored === true
       }
     } else {
+      // GPT-4o returned nothing usable. Mark document failed and log.
+      await supabase.from('documents')
+        .update({ extraction_status: 'failed' })
+        .eq('id', documentId)
       await logError(supabase, documentId, userId, 'EXTRACTION_FAILED', 'OpenAI returned no data for this document')
     }
 
