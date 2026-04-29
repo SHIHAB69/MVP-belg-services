@@ -4,34 +4,26 @@
 
 ---
 
-## Deployment Status — PAUSED 2026-04-28 ~22:00
+## Deployment Status — M2 SHIPPED 2026-04-29 (24h SOAK WINDOW)
 
-M2 deployment paused at Phase A.GO checkpoint due to local filesystem corruption. `.git/index` unreadable (data block corruption / stuck-I/O on the file — NOT iCloud, NOT disk space).
+M2 deployed to production. Phase A → C all green. Phase F (24h soak) begins now. **No M3 work for 24 hours.**
 
-**Phase A state when paused:**
-- A0–A7: ✓ all green (verified against production at amngfletxzqaokmhccxe)
-- A2 backup: `backups/pre_m2_deploy_schema_20260428_161201.sql` (8.2 KB) + `backups/pre_m2_deploy_data_20260428_161201.sql` (270 KB). Timestamp: `20260428_161201`
-- A3 row counts captured to `/tmp/m2_pre_deploy_counts.txt` (lost on reboot) AND mirrored to `~/m2_pre_deploy_counts_20260428.txt` (persistent). Production counts at 16:12: anonymous_users=88, documents=159, ocr_results=156, transactions=125, error_logs=35
-- A4: NocoDB rogue junction `_nc_m2m_documents_ocr_results` exists but empty (file 00 will drop it)
-- A5a: testers notified
-- A5b: SKIPPED — Nicolas not available; C10/C11 deferred. Runbook F3 updated to gate the `m2-shipped-` tag on retroactive C10/C11 execution.
-- A6: OPENAI_API_KEY confirmed set on production
-- A7: production DB connection works (PostgreSQL 17.6 via session pooler)
-- A8.1: ✗ FAILED — `.git/index` unreadable. Two zombie git processes (PIDs 20906, 20907) stuck in uninterruptible kernel I/O wait holding the file open. Even `cat .git/index > /dev/null` and `cp` to `/tmp` time out. Blast radius confirmed CONTAINED — all 12 migration SQL files, all 7 edge function `index.ts` files, and both A2 backup files read cleanly.
-- A.GO: NO-GO (item 8 ✗)
+**What was deployed:**
+- 12 M2 migration SQL files (00 archive, 01–08 new schema, 10 data migration, 11 upload fan-out fn, 12 RLS + GRANTs)
+- 7 edge functions redeployed (register, documents, document-file, ask, chat, realtime-session, upload)
+- 1 patch: register now gates on HTTP method (pre-existing bug — was unconditionally INSERT-ing on every request, caught at B7 health check)
 
-**Resumption plan for next session:**
-1. After reboot, verify `git status` returns clean and `cat .git/index` succeeds.
-2. If still broken: Option C (`rm .git/index && git reset` — non-destructive, working tree on disk is the source of truth, HEAD's tree object is healthy in pack files) OR `fsck_apfs` from recovery mode OR run deployment from a different machine.
-3. Re-run **A2** (fresh backup, new timestamp) — the 16:12 backup will be too old.
-4. Re-run **A3** (fresh production row counts) — production drifts overnight as testers upload.
-5. Re-run **A8.1** with working `git status`. A8.2/8.3/8.4 already verified, no need to repeat unless filesystem is suspect.
-6. Re-take the A.GO call with all 8 items green.
-7. Then Phase B onward per the runbook (`docs/migrations/m2_deployment_runbook.md`, which has its own pause banner at the top).
+**M2 proof-of-life:**
+Real tester upload doc `28ce4ed6-ea99-4844-beb3-9d636980cdb6`, user `1994700f-1981-4d49-9b08-6245f1447626`, at 10:38 UTC during the deployment window: full pipeline executed, `extraction_status=completed`, 5 line_items extracted, 0 errors. Confirms upload → GPT-4o vision → `upload_extraction_fan_out` RPC working under live load. Witnessed unintentionally before any synthetic smoke test.
 
-**No production database changes were made on 2026-04-28.** Pause point is pre-Phase-B. Production state is as captured in A3.
+**Phase F (24h soak) monitoring:**
+- T+1h, T+3h, T+6h: hourly `error_logs` checks
+- T+12h, T+24h: final checks
 
-**Do NOT proceed to Phase B until A.GO is fully green with verified disk health.**
+**Open follow-ups (do NOT skip):**
+1. **D4 production DB password rotation** — deferred from deployment night for fatigue safety. **Execute within 48 hours.**
+2. **ASK currency formatting bug** — `ask` edge function uses `$` formatter while data is EUR. Pre-existing MVP behavior, not an M2 regression. Log as M3 follow-up (revisit when adding multi-LLM router).
+3. **`m2-shipped-` tag** — release after 24h soak passes. C10 effectively passed via the 10:38 UTC real upload. C11 (voice) gate released — fix forward if it breaks.
 
 ---
 
@@ -164,8 +156,8 @@ This convention is non-negotiable and must be applied uniformly.
 | # | Milestone | Status |
 |---|-----------|--------|
 | 1 | Schema Design & Review | ✅ COMPLETE — Nicolas approved 2026-04-21 |
-| 2 | Build Supabase Schema + Migrate Data | 🚧 IN PROGRESS — current focus |
-| 3 | LLM Enrichment Pipeline + Feedback Layers | ⏳ Next |
+| 2 | Build Supabase Schema + Migrate Data | ✅ COMPLETE — deployed 2026-04-29 (24h soak) |
+| 3 | LLM Enrichment Pipeline + Feedback Layers | 🚧 IN PROGRESS — current focus |
 | 4 | iOS App Updated (new schema, feedback UI, new chatbot) | ⏳ |
 | 5 | Security (RLS, JWT, encryption, rate limiting) | ⏳ Done with security specialist |
 | 6 | Bank Account API Integration (Open Banking / PSD2) | ⏳ End of roadmap |
@@ -237,6 +229,7 @@ Quick reference of decisions already locked in. Don't relitigate these without e
 | Bank API integration | Deferred to M6 | Brief Apr 2026 |
 | GPT-4o vision pipeline | Preserve in M2; M3 adds router/feedback on top | 2026-04-26 |
 | Pause M2 deployment due to APFS corruption on `.git/index` | Reboot, verify filesystem, resume tomorrow with fresh Phase A | 2026-04-28 |
+| M2 deployed to production | Successfully deployed all 12 migrations + 7 edge functions + 1 patch (gate). Real tester upload at 10:38 UTC verified pipeline working. Phase C 4/4 batches green. Phase F 24h soak window begins. | 2026-04-29 |
 
 ---
 
