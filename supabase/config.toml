@@ -435,3 +435,8 @@ entrypoint = "./functions/documents/index.ts"
 enabled = true
 verify_jwt = false
 entrypoint = "./functions/document-file/index.ts"
+
+[functions.update_user_profile]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/update_user_profile/index.ts"
