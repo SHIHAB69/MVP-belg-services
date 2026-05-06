@@ -126,6 +126,21 @@ Deno.serve(async (req) => {
       if (!isNaN(n) && n >= 1 && n <= MAX_LIMIT) limit = n
     }
 
+    // Optional cursor for keyset pagination (created_at-based).
+    // Backwards-compatible: clients that omit cursor get page 1 as before.
+    // TODO(M3+): Composite cursor (created_at, id) for tie-breaking
+    // when bulk imports produce identical microsecond timestamps.
+    // Current pure-timestamp cursor is safe for human upload patterns.
+    const cursorParam = url.searchParams.get('cursor')
+    if (cursorParam !== null && cursorParam.length > 0) {
+      const parsed = new Date(cursorParam)
+      if (isNaN(parsed.getTime())) {
+        return new Response(JSON.stringify({ error: 'Invalid cursor (must be ISO 8601 timestamp)' }), {
+          headers: { 'Content-Type': 'application/json' }, status: 400,
+        })
+      }
+    }
+
     if (!user_id || !isValidUUID(user_id)) {
       return new Response(JSON.stringify({ error: 'Missing or invalid user_id (must be a valid UUID)' }), {
         headers: { 'Content-Type': 'application/json' }, status: 400,
@@ -135,7 +150,7 @@ Deno.serve(async (req) => {
     // Rich JOIN matching the new schema. PostgREST nested embedding fetches
     // documents -> transactions/receipts/invoices/line_items in one round trip.
     // Sub-embeds: receipts -> stores; transactions -> payment_methods.
-    const { data: docs, error } = await supabase
+    let query = supabase
       .from('documents')
       .select(`
         id, file_path, file_url, mime_type, file_size, created_at,
@@ -186,6 +201,12 @@ Deno.serve(async (req) => {
         )
       `)
       .eq('user_id', user_id)
+
+    if (cursorParam !== null && cursorParam.length > 0) {
+      query = query.lt('created_at', cursorParam)
+    }
+
+    const { data: docs, error } = await query
       .order('created_at', { ascending: false })
       .order('created_at', { ascending: true, referencedTable: 'line_items' })
       .limit(limit)
@@ -282,7 +303,12 @@ Deno.serve(async (req) => {
       }
     })
 
-    return new Response(JSON.stringify({ documents }), {
+    const has_more = documents.length === limit
+    const next_cursor = has_more && documents.length > 0
+      ? documents[documents.length - 1].created_at
+      : null
+
+    return new Response(JSON.stringify({ documents, next_cursor, has_more }), {
       headers: {
         'Content-Type': 'application/json',
         'Cache-Control': 'private, no-store',
